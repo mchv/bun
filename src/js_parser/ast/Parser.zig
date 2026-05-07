@@ -1061,50 +1061,27 @@ pub const Parser = struct {
             if (p.options.features.commonjs_at_runtime) {
                 wrap_mode = .bun_commonjs;
 
-                const import_record: ?*const ImportRecord = brk: {
+                const has_import_stmt = brk: {
                     for (p.import_records.items) |*import_record| {
                         if (import_record.flags.is_internal or import_record.flags.is_unused) continue;
-                        if (import_record.kind == .stmt) break :brk import_record;
+                        if (import_record.kind == .stmt) break :brk true;
                     }
 
-                    break :brk null;
+                    break :brk false;
                 };
 
-                // make it an error to use an import statement with a commonjs exports usage
-                if (import_record) |record| {
-                    // find the usage of the export symbol
-
-                    var notes = ListManaged(logger.Data).init(p.allocator);
-
-                    try notes.append(logger.Data{
-                        .text = try std.fmt.allocPrint(p.allocator, "Try require({f}) instead", .{bun.fmt.QuotedFormatter{ .text = record.path.text }}),
-                    });
-
-                    if (uses_module_ref) {
-                        try notes.append(logger.Data{
-                            .text = "This file is CommonJS because 'module' was used",
-                        });
+                // If the file has import statements alongside module.exports/exports,
+                // convert the imports to require() calls so they work inside the CJS
+                // function wrapper. Import statements cannot appear inside a function
+                // body, but require() can.
+                // See: https://github.com/oven-sh/bun/issues/20718
+                if (has_import_stmt) {
+                    for (p.import_records.items) |*import_record| {
+                        if (import_record.flags.is_internal or import_record.flags.is_unused) continue;
+                        if (import_record.kind == .stmt) {
+                            import_record.kind = .require;
+                        }
                     }
-
-                    if (uses_exports_ref) {
-                        try notes.append(logger.Data{
-                            .text = "This file is CommonJS because 'exports' was used",
-                        });
-                    }
-
-                    if (p.has_top_level_return) {
-                        try notes.append(logger.Data{
-                            .text = "This file is CommonJS because top-level return was used",
-                        });
-                    }
-
-                    if (p.has_with_scope) {
-                        try notes.append(logger.Data{
-                            .text = "This file is CommonJS because a \"with\" statement is used",
-                        });
-                    }
-
-                    try p.log.addRangeErrorWithNotes(p.source, record.range, "Cannot use import statement with CommonJS-only features", notes.items);
                 }
             }
         } else {

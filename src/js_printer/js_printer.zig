@@ -4587,6 +4587,54 @@ fn NewPrinter(
                         return;
                     }
 
+                    // When an import statement was converted to require (e.g. in a CJS
+                    // file that also has module.exports), print as:
+                    //   const { x, y } = require("path")
+                    //   const name = require("path")
+                    // See: https://github.com/oven-sh/bun/issues/20718
+                    if (record.kind == .require) {
+                        if (s.default_name != null or s.items.len > 0 or record.flags.contains_import_star) {
+                            p.print("const ");
+                            if (record.flags.contains_import_star) {
+                                p.printSymbol(s.namespace_ref);
+                            } else if (s.default_name != null and s.items.len == 0) {
+                                p.printSymbol(s.default_name.?.ref.?);
+                            } else {
+                                p.print("{");
+                                p.printSpace();
+                                if (s.default_name) |name| {
+                                    p.print("default:");
+                                    p.printSpace();
+                                    p.printSymbol(name.ref.?);
+                                    if (s.items.len > 0) {
+                                        p.print(",");
+                                        p.printSpace();
+                                    }
+                                }
+                                for (s.items, 0..) |item, i| {
+                                    p.printClauseItemAs(item, .@"var");
+                                    if (i < s.items.len - 1) {
+                                        p.print(",");
+                                        p.printSpace();
+                                    }
+                                }
+                                p.printSpace();
+                                p.print("}");
+                            }
+                            p.@"print = "();
+                            p.print("require(");
+                            p.printImportRecordPath(record);
+                            p.print(")");
+                        } else {
+                            // Bare import: import 'foo' -> require('foo')
+                            p.print("require(");
+                            p.printImportRecordPath(record);
+                            p.print(")");
+                        }
+                        p.printSemicolonAfterStatement();
+                        return;
+                    }
+
                     p.print("import");
 
                     var item_count: usize = 0;
