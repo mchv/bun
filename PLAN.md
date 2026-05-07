@@ -18,37 +18,35 @@ import { SlashCommandBuilder } from '@discordjs/builders';
 module.exports = { d: new SlashCommandBuilder() }
 ```
 
-## Root Cause Hypothesis
+## Root Cause (Confirmed)
 
-Based on reading `src/jsc/bindings/JSCommonJSModule.cpp:172-185`:
+The bug is in the **transpiler → CJS wrapper pipeline**:
 
-1. Bun's transpiler detects `module.exports` and decides the file is CJS
-2. It wraps the file in `(function(exports, require, module, __filename, __dirname) { ... })`
-3. The wrapped code is evaluated via `JSC::evaluate()`
-4. The result is expected to be a callable function object
+1. A file has both `import` statements AND `module.exports`
+2. Bun's parser detects `module.exports` and flags the file as CJS (`uses_module_ref = true`)
+3. The transpiler keeps the `import` statements as-is (doesn't convert to `require()`)
+4. `JSCommonJSModule.cpp:721` wraps the code in `(function(exports,require,module,__filename,__dirname){ ... })`
+5. The resulting code has `import` inside a function — **invalid JavaScript**
+6. JSC evaluates it and returns something that's not a callable function
+7. Line 178 checks `fn.getObject()` → null → throws the error
 
-The bug: when the CJS file contains `import` statements (which bun allows in CJS via its transpiler), the transpiler may:
-- Fail to properly wrap the function (syntax issue in the output)
-- Or produce an async module (due to top-level await from ESM deps) that can't be synchronously evaluated as a function
+**Key finding**: `src/js_parser/ast/P.zig:217` has a `legacy_cjs_import_stmts` field that was designed to handle this case, but it's **never populated** — only declared and initialized empty.
 
-The key code path is in `JSCommonJSModule.cpp` line 172:
-```cpp
-JSValue fnValue = JSC::evaluate(globalObject, code, jsUndefined());
-// ...
-JSObject* fn = fnValue.getObject();
-if (!fn) [[unlikely]] {
-    // ERROR: "Expected CommonJS module to have a function wrapper"
-}
-```
+## Fix Strategy
 
-`fnValue` is not an object — it's likely `undefined` or a Promise (if the module became async).
+The fix should be in the transpiler/printer: when outputting a CJS module (one that will be wrapped in a function), any `import` statements must be converted to `require()` calls. This is what Node.js does — you can't have `import` inside a CJS module.
 
-## Approach
+Two possible approaches:
 
-1. **Write a failing test** that reproduces #20718 (dynamic import of CJS file with ESM dependency)
-2. **Add logging** to see what `fnValue` actually is when the error occurs
-3. **Trace the transpiler output** to see if the function wrapper is correctly generated
-4. **Fix** either the transpiler (to correctly wrap) or the loader (to handle async CJS modules)
+### Approach A: Convert imports to require in the printer (simpler)
+When `uses_module_ref` is true and the output format is CJS (Program type), convert all `import { x } from 'y'` to `const { x } = require('y')` in the printer stage.
+
+### Approach B: Detect the conflict earlier in the parser
+When the parser sees both `import` and `module.exports`, either:
+- Treat the file as ESM (ignore `module.exports`, convert to `export default`)
+- Or convert imports to require during parsing (populate `legacy_cjs_import_stmts`)
+
+Approach A is simpler and less risky. The printer already has access to `uses_module_ref` and can conditionally emit `require()` instead of `import`.
 
 ## Files to Modify
 
