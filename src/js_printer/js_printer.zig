@@ -4590,27 +4590,72 @@ fn NewPrinter(
                     // When an import statement was converted to require (e.g. in a CJS
                     // file that also has module.exports), print as:
                     //   const { x, y } = require("path")
-                    //   const name = require("path")
+                    //   const { default: name } = require("path")
+                    //   const ns = require("path")
                     // See: https://github.com/oven-sh/bun/issues/20718
                     if (record.kind == .require) {
                         if (s.default_name != null or s.items.len > 0 or record.flags.contains_import_star) {
                             p.print("const ");
-                            if (record.flags.contains_import_star) {
+                            if (record.flags.contains_import_star and s.default_name == null) {
+                                // import * as ns from 'y' -> const ns = require("y")
                                 p.printSymbol(s.namespace_ref);
-                            } else if (s.default_name != null and s.items.len == 0) {
+                            } else if (record.flags.contains_import_star and s.default_name != null) {
+                                // import def, * as ns from 'y'
+                                // -> const ns = require("y"), def = (m=>m.default??m)(ns)
+                                p.printSymbol(s.namespace_ref);
+                                p.@"print = "();
+                                p.print("require(");
+                                p.printImportRecordPath(record);
+                                p.print("), ");
                                 p.printSymbol(s.default_name.?.ref.?);
+                                p.@"print = "();
+                                p.print("(m=>m.default??m)(");
+                                p.printSymbol(s.namespace_ref);
+                                p.print(")");
+                                p.printSemicolonAfterStatement();
+                                return;
                             } else {
-                                p.print("{");
-                                p.printSpace();
-                                if (s.default_name) |name| {
-                                    p.print("default:");
-                                    p.printSpace();
-                                    p.printSymbol(name.ref.?);
-                                    if (s.items.len > 0) {
+                                // import { x } from 'y' -> const { x } = require("y")
+                                // import def from 'y' -> const def = (m => m.default ?? m)(require("y"))
+                                // import def, { x } from 'y' -> const { default: def, x } = require("y")
+                                if (s.default_name != null) {
+                                    // Default import (with or without named): handle CJS/ESM compat.
+                                    // Emit: const def = (m=>m.default??m)(_m=require("y")), {named} = _m
+                                    // For default-only: const def = (m=>m.default??m)(require("y"))
+                                    if (s.items.len == 0) {
+                                        p.printSymbol(s.default_name.?.ref.?);
+                                        p.@"print = "();
+                                        p.print("(m=>m.default??m)(require(");
+                                        p.printImportRecordPath(record);
+                                        p.print("))");
+                                    } else {
+                                        // import def, { x, y } from 'mod'
+                                        // -> const [def, { x, y }] = ((m)=>[m.default??m,m])(require("mod"))
+                                        p.print("[");
+                                        p.printSymbol(s.default_name.?.ref.?);
                                         p.print(",");
                                         p.printSpace();
+                                        p.print("{");
+                                        p.printSpace();
+                                        for (s.items, 0..) |item, i| {
+                                            p.printClauseItemAs(item, .@"var");
+                                            if (i < s.items.len - 1) {
+                                                p.print(",");
+                                                p.printSpace();
+                                            }
+                                        }
+                                        p.printSpace();
+                                        p.print("}]");
+                                        p.@"print = "();
+                                        p.print("((m)=>[m.default??m,m])(require(");
+                                        p.printImportRecordPath(record);
+                                        p.print("))");
                                     }
+                                    p.printSemicolonAfterStatement();
+                                    return;
                                 }
+                                p.print("{");
+                                p.printSpace();
                                 for (s.items, 0..) |item, i| {
                                     p.printClauseItemAs(item, .@"var");
                                     if (i < s.items.len - 1) {
