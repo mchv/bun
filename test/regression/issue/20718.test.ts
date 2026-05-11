@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { bunEnv, bunExe, tempDir, isWindows } from "harness";
 import path from "path";
+import fs from "fs";
 
 // https://github.com/oven-sh/bun/issues/20718
 // dynamic import() of a file that uses both `import` statements and
@@ -367,5 +368,66 @@ test("default and named import from Node builtin combined with module.exports", 
 
   expect(stderr).not.toContain("Expected CommonJS module to have a function wrapper");
   expect(stdout.trim()).toBe(JSON.stringify({ sep: path.sep, joined: path.join("a","b"), resolved: "function" }));
+  expect(exitCode).toBe(0);
+});
+
+test("require() of ESM module with diamond dependency through barrel should not deadlock", async () => {
+  const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "bun-test-"));
+
+  // shared.js - leaf module
+  fs.writeFileSync(path.join(dir, "shared.js"), `
+    import path from 'path';
+    export const SHARED = path.sep;
+  `);
+
+  // barrel.js - re-exports shared
+  fs.writeFileSync(path.join(dir, "barrel.js"), `
+    import { SHARED } from './shared.js';
+    export { SHARED };
+    export const BARREL = 'barrel';
+  `);
+
+  // a.js - imports from barrel
+  fs.writeFileSync(path.join(dir, "a.js"), `
+    import { SHARED } from './barrel.js';
+    export default function a() { return SHARED; }
+  `);
+
+  // b.js - also imports from barrel
+  fs.writeFileSync(path.join(dir, "b.js"), `
+    import { BARREL } from './barrel.js';
+    export default function b() { return BARREL; }
+  `);
+
+  // app.js - imports a, b AND shared directly (diamond pattern)
+  fs.writeFileSync(path.join(dir, "app.js"), `
+    import a from './a.js';
+    import b from './b.js';
+    import { SHARED } from './shared.js';
+    export default { a: a(), b: b(), shared: SHARED };
+  `);
+
+  // entry.js - require() the ESM module
+  fs.writeFileSync(path.join(dir, "entry.js"), `
+    const mod = require('./app.js');
+    console.log(JSON.stringify(mod.default));
+  `);
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "run", "entry.js"],
+    cwd: dir,
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    proc.stdout.text(),
+    proc.stderr.text(),
+    proc.exited,
+  ]);
+
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout.trim())).toEqual({ a: path.sep, b: "barrel", shared: path.sep });
   expect(exitCode).toBe(0);
 });
