@@ -2218,6 +2218,13 @@ impl<'a> Parser<'a> {
             p.generate_import_stmt_for_bake_response(&mut before)?;
         }
 
+        // Hoist jest.mock() calls: reorder imports before jest.mock() in each part.
+        // In bun, mock.module() patches already-resolved ESM bindings, so imports
+        // must be evaluated first for the mock to take effect.
+        if p.options.features.inject_jest_globals {
+            hoist_jest_mock_calls(p, &mut parts);
+        }
+
         if !before.is_empty() || !after.is_empty() {
             // Single up-front reserve preserves the Zig fused-growth; the inner
             // reserve() calls in prepend_from / append become no-ops.
@@ -2342,3 +2349,155 @@ pub type MacroContext = Option<*mut c_void>;
 pub type MacroContext = crate::Macro::MacroContext;
 
 // ported from: src/js_parser/ast/Parser.zig
+
+/// Move top-level import statements BEFORE jest.mock() calls.
+/// In bun, mock.module() patches already-resolved ESM bindings, so imports
+/// must be evaluated first for the mock to take effect. Handles both cases:
+/// 1. jest.mock() after imports → move imports before jest.mock
+/// 2. jest.mock() before imports → move imports to the top
+/// 3. jest.mock("path", factory) with a factory → convert matching import to require()
+///    so the real module is never loaded (virtualModules intercepts the require at runtime)
+fn hoist_jest_mock_calls<'a, const TS: bool, const SO: bool>(p: &mut P<'a, TS, SO>, parts: &mut BumpVec<'a, js_ast::Part>) {
+    for part in parts.iter_mut() {
+        let stmts = part.stmts.slice();
+        if stmts.is_empty() {
+            continue;
+        }
+
+        // Collect paths from jest.mock calls that have a factory (2+ args).
+        // These imports should be converted to require() to prevent real module loading.
+        let mut mocked_paths: Vec<&[u8]> = Vec::new();
+
+        // Only reorder when a mock call appears BEFORE an import (meaning imports
+        // need to be moved up). If all mocks are already after all imports, no
+        // reordering is needed.
+        let mut has_mock = false;
+        let mut needs_reorder = false;
+        for stmt in stmts {
+            if is_hoistable_jest_mock_call(p, stmt) {
+                has_mock = true;
+                // If it has a factory (2+ args), collect the path for import→require conversion
+                if let Some(path) = get_jest_mock_path_with_factory(p, stmt) {
+                    mocked_paths.push(path);
+                }
+            } else if matches!(stmt.data, js_ast::StmtData::SImport(_)) {
+                if has_mock {
+                    needs_reorder = true;
+                }
+            }
+        }
+
+        // Convert imports of mocked modules to require() by changing their import record kind.
+        // This prevents the real module from loading — require() checks virtualModules at runtime.
+        if !mocked_paths.is_empty() {
+            let stmts = part.stmts.slice();
+            for stmt in stmts {
+                if let js_ast::StmtData::SImport(s_import) = &stmt.data {
+                    let idx = s_import.import_record_index as usize;
+                    let path_matches = mocked_paths.iter().any(|path| {
+                        p.import_records.items()[idx].path.text == *path
+                    });
+                    if path_matches {
+                        p.import_records.items_mut()[idx].kind = bun_ast::ImportKind::Require;
+                    }
+                }
+            }
+        }
+
+        if !needs_reorder {
+            continue;
+        }
+
+        // Reorder: imports first, then everything else in original relative order.
+        // Use arena allocation to avoid heap Vec overhead.
+        let mut imports = BumpVec::<Stmt>::with_capacity_in(stmts.len(), p.arena);
+        let mut rest = BumpVec::<Stmt>::with_capacity_in(stmts.len(), p.arena);
+        for stmt in stmts {
+            if matches!(stmt.data, js_ast::StmtData::SImport(_)) {
+                imports.push(*stmt);
+            } else {
+                rest.push(*stmt);
+            }
+        }
+
+        // Build the reordered slice directly in the arena
+        let total = imports.len() + rest.len();
+        let new_stmts = p.arena.alloc_slice_fill_with(total, |i| {
+            if i < imports.len() {
+                imports[i]
+            } else {
+                rest[i - imports.len()]
+            }
+        });
+        part.stmts = bun_ast::StoreSlice::new_mut(new_stmts);
+    }
+}
+
+/// Check if a statement is a top-level jest.mock() or jest.unmock() call
+/// with a string literal as the first argument.
+fn is_hoistable_jest_mock_call<const TS: bool, const SO: bool>(p: &P<'_, TS, SO>, stmt: &Stmt) -> bool {
+    let js_ast::StmtData::SExpr(s_expr) = &stmt.data else {
+        return false;
+    };
+    let js_ast::ExprData::ECall(call) = &s_expr.value.data else {
+        return false;
+    };
+    let js_ast::ExprData::EDot(dot) = &call.target.data else {
+        return false;
+    };
+    // Check method name is "mock" or "unmock"
+    if dot.name != b"mock" && dot.name != b"unmock" {
+        return false;
+    }
+    // Check the object is the jest identifier
+    let js_ast::ExprData::EIdentifier(id) = &dot.target.data else {
+        return false;
+    };
+    if !id.ref_.eql(p.jest.jest) {
+        return false;
+    }
+    // Only hoist if first argument is a string literal
+    if call.args.is_empty() {
+        return false;
+    }
+    matches!(call.args[0].data, js_ast::ExprData::EString(_))
+}
+
+/// For a jest.mock("path", factory) call with 2+ args, return the path string bytes.
+/// Returns None if the call has no factory (1 arg only) or isn't a jest.mock call.
+fn get_jest_mock_path_with_factory<'a, const TS: bool, const SO: bool>(p: &P<'a, TS, SO>, stmt: &'a Stmt) -> Option<&'a [u8]> {
+    let js_ast::StmtData::SExpr(s_expr) = &stmt.data else {
+        return None;
+    };
+    let js_ast::ExprData::ECall(call) = &s_expr.value.data else {
+        return None;
+    };
+    // Must have at least 2 args (path + factory)
+    if call.args.len() < 2 {
+        return None;
+    }
+    let js_ast::ExprData::EDot(dot) = &call.target.data else {
+        return None;
+    };
+    // Only "mock" (not "unmock") has factories
+    if dot.name != b"mock" {
+        return None;
+    }
+    let js_ast::ExprData::EIdentifier(id) = &dot.target.data else {
+        return None;
+    };
+    if !id.ref_.eql(p.jest.jest) {
+        return None;
+    }
+    // Extract the path string
+    if let js_ast::ExprData::EString(s) = &call.args[0].data {
+        if s.is_utf8() {
+            Some(s.slice8())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+

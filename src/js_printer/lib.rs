@@ -6010,6 +6010,69 @@ pub mod __gated_printer {
                         return Ok(());
                     }
 
+                    // When an import was converted to require (jest.mock factory prevention),
+                    // emit as const { x } = require("path") or const x = require("path").default
+                    if record.kind == ImportKind::Require {
+                        if s.default_name.is_some()
+                            || !slice_of(s.items).is_empty()
+                            || record.flags.contains(ImportRecordFlags::CONTAINS_IMPORT_STAR)
+                        {
+                            self.print(b"const ");
+                            if record.flags.contains(ImportRecordFlags::CONTAINS_IMPORT_STAR)
+                                && s.default_name.is_none()
+                            {
+                                // import * as ns from 'y' -> const ns = require("y")
+                                self.print_symbol(s.namespace_ref);
+                            } else if let Some(default_name) = &s.default_name {
+                                if slice_of(s.items).is_empty() {
+                                    // import def from 'y' -> const def = (m=>m.default??m)(require("y"))
+                                    self.print_symbol(default_name.ref_.unwrap());
+                                    self.print_equals();
+                                    self.print(b"(m=>m.default??m)(require(");
+                                    self.print_import_record_path(record);
+                                    self.print(b"))");
+                                    self.print_semicolon_after_statement();
+                                    self.prev_stmt_tag = new_tag;
+                                    return Ok(());
+                                } else {
+                                    // import def, { x } from 'y' -> const { default: def, x } = require("y")
+                                    self.print(b"{ default: ");
+                                    self.print_symbol(default_name.ref_.unwrap());
+                                    self.print(b", ");
+                                    for (i, item) in slice_of(s.items).iter().enumerate() {
+                                        self.print_clause_item_as(item, ClauseItemAs::Var);
+                                        if i < slice_of(s.items).len() - 1 {
+                                            self.print(b", ");
+                                        }
+                                    }
+                                    self.print(b" }");
+                                }
+                            } else {
+                                // import { x } from 'y' -> const { x } = require("y")
+                                self.print(b"{ ");
+                                for (i, item) in slice_of(s.items).iter().enumerate() {
+                                    self.print_clause_item_as(item, ClauseItemAs::Var);
+                                    if i < slice_of(s.items).len() - 1 {
+                                        self.print(b", ");
+                                    }
+                                }
+                                self.print(b" }");
+                            }
+                            self.print_equals();
+                            self.print(b"require(");
+                            self.print_import_record_path(record);
+                            self.print(b")");
+                        } else {
+                            // Bare import: import 'foo' -> require('foo')
+                            self.print(b"require(");
+                            self.print_import_record_path(record);
+                            self.print(b")");
+                        }
+                        self.print_semicolon_after_statement();
+                        self.prev_stmt_tag = new_tag;
+                        return Ok(());
+                    }
+
                     self.print(b"import");
 
                     let mut item_count: usize = 0;
